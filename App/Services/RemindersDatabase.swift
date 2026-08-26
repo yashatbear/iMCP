@@ -17,10 +17,15 @@ private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self
 /// Writing to this store directly would corrupt CoreData bookkeeping and break
 /// iCloud sync — all mutations must continue to go through EventKit.
 final class RemindersDatabase {
-    enum Error: LocalizedError {
+    /// Errors are surfaced to MCP clients by string interpolation, so this
+    /// deliberately conforms to `CustomStringConvertible` as well — a bare enum
+    /// case name would tell the caller nothing about how to fix the problem.
+    enum Error: LocalizedError, CustomStringConvertible {
         case accessDenied
         case storeNotFound
         case sqlite(String)
+
+        var description: String { errorDescription ?? "Reminders database error" }
 
         var errorDescription: String? {
             switch self {
