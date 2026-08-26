@@ -59,6 +59,7 @@ enum ServiceRegistry {
             RemindersService.shared,
             ShortcutsService.shared,
             UtilitiesService.shared,
+            NotesService.shared,
         ]
         #if WEATHERKIT_AVAILABLE
             services.append(WeatherService.shared)
@@ -76,7 +77,8 @@ enum ServiceRegistry {
         remindersEnabled: Binding<Bool>,
         shortcutsEnabled: Binding<Bool>,
         utilitiesEnabled: Binding<Bool>,
-        weatherEnabled: Binding<Bool>
+        weatherEnabled: Binding<Bool>,
+        notesEnabled: Binding<Bool>
     ) -> [ServiceConfig] {
         var configs: [ServiceConfig] = [
             ServiceConfig(
@@ -147,6 +149,15 @@ enum ServiceRegistry {
                 )
             )
         #endif
+        configs.append(
+            ServiceConfig(
+                name: "Notes",
+                iconName: "note.text",
+                color: .yellow,
+                service: NotesService.shared,
+                binding: notesEnabled
+            )
+        )
         return configs
     }
 }
@@ -175,6 +186,7 @@ final class ServerController: ObservableObject {
     @AppStorage("shortcutsEnabled") private var shortcutsEnabled = false
     @AppStorage("utilitiesEnabled") private var utilitiesEnabled = true  // Default enabled
     @AppStorage("weatherEnabled") private var weatherEnabled = false
+    @AppStorage("notesEnabled") private var notesEnabled = false
 
     // MARK: - AppStorage for Trusted Clients
     @AppStorage("trustedClients") private var trustedClientsData = Data()
@@ -191,14 +203,16 @@ final class ServerController: ObservableObject {
             remindersEnabled: $remindersEnabled,
             shortcutsEnabled: $shortcutsEnabled,
             utilitiesEnabled: $utilitiesEnabled,
-            weatherEnabled: $weatherEnabled
+            weatherEnabled: $weatherEnabled,
+            notesEnabled: $notesEnabled
         )
     }
 
-    private var currentServiceBindings: [String: Binding<Bool>] {
+    // Extract Bool values on the MainActor to avoid cross-actor Binding access issues.
+    private var currentServiceEnabledMap: [String: Bool] {
         Dictionary(
             uniqueKeysWithValues: computedServiceConfigs.map {
-                ($0.id, $0.binding)
+                ($0.id, $0.binding.wrappedValue)
             }
         )
     }
@@ -264,7 +278,7 @@ final class ServerController: ObservableObject {
     init() {
         Task {
             // Initialize bindings from AppStorage before the server starts.
-            await networkManager.updateServiceBindings(self.currentServiceBindings)
+            await networkManager.updateServiceBindings(self.currentServiceEnabledMap)
             await self.networkManager.start()
             self.updateServerStatus("Running")
 
@@ -300,9 +314,9 @@ final class ServerController: ObservableObject {
         }
     }
 
-    func updateServiceBindings(_ bindings: [String: Binding<Bool>]) async {
+    func updateServiceBindings(_ enabled: [String: Bool]) async {
         // Called by the UI when service toggles change.
-        await networkManager.updateServiceBindings(bindings)
+        await networkManager.updateServiceBindings(enabled)
     }
 
     func startServer() async {
@@ -635,7 +649,7 @@ actor ServerNetworkManager {
     private var connectionApprovalHandler: ConnectionApprovalHandler?
 
     private let services = ServiceRegistry.services
-    private var serviceBindings: [String: Binding<Bool>] = [:]
+    private var serviceBindings: [String: Bool] = [:]
 
     init() {
         do {
@@ -874,11 +888,7 @@ actor ServerNetworkManager {
             if await self.isEnabledState {
                 for service in await self.services {
                     let serviceId = String(describing: type(of: service))
-
-                    // Read binding on the actor for consistency.
-                    if let isServiceEnabled = await self.serviceBindings[serviceId]?.wrappedValue,
-                        isServiceEnabled
-                    {
+                    if await self.serviceBindings[serviceId] == true {
                         for tool in service.tools {
                             log.debug("Adding tool: \(tool.name)")
                             tools.append(
@@ -925,10 +935,7 @@ actor ServerNetworkManager {
             for service in await self.services {
                 let serviceId = String(describing: type(of: service))
 
-                // Read binding on the actor for consistency.
-                if let isServiceEnabled = await self.serviceBindings[serviceId]?.wrappedValue,
-                    isServiceEnabled
-                {
+                if await self.serviceBindings[serviceId] == true {
                     do {
                         guard
                             let value = try await service.call(
@@ -1017,8 +1024,8 @@ actor ServerNetworkManager {
         }
     }
 
-    // Update service bindings.
-    func updateServiceBindings(_ newBindings: [String: Binding<Bool>]) async {
+    // Update service enabled states.
+    func updateServiceBindings(_ newBindings: [String: Bool]) async {
         self.serviceBindings = newBindings
 
         // Notify clients that tool availability may have changed.
