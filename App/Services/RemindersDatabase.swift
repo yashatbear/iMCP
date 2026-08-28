@@ -288,11 +288,32 @@ final class RemindersDatabase {
         return result
     }
 
+    /// Drops membership entries that point at a section which no longer exists.
+    ///
+    /// Deleting a section in Reminders.app tombstones the section row
+    /// (`ZMARKEDFORDELETION = 1`, and its `ZLIST` link is cleared) but leaves the
+    /// *memberships* blob on the owning list untouched — every reminder that was
+    /// in that section keeps a stale `groupID` pointing at it, sometimes for
+    /// years. Reminders.app resolves those to nothing and draws the reminder at
+    /// the top of the list, i.e. unsectioned.
+    ///
+    /// Callers ask two questions of this map: "which section is this reminder
+    /// in?" and "is it in no section at all?". If stale entries survive, a
+    /// reminder answers *yes* to the first (so it is never counted as
+    /// unsectioned) while matching no live section (so it is never listed under
+    /// one) — it silently vanishes from the accounting. On one real list that
+    /// dropped 285 of 548 reminders. Resolving membership against the live
+    /// sections up front keeps the two questions consistent.
+    private func membershipsResolved(
+        from data: Data?,
+        liveSectionIdentifiers: Set<String>
+    ) -> [String: String] {
+        memberships(from: data).filter { liveSectionIdentifiers.contains($0.value) }
+    }
+
     struct Section {
         let identifier: String
         let name: String
-        /// Members in the order Reminders stores them, identified by CloudKit identifier.
-        var memberIdentifiers: [String] = []
     }
 
     struct ListSections {
@@ -337,21 +358,21 @@ final class RemindersDatabase {
             )
             guard !sectionRows.isEmpty else { continue }
 
-            let membership = memberships(from: list.data("memberships"))
-
             var sections: [Section] = []
             for row in sectionRows {
                 guard let sectionIdentifier = row.string("ZCKIDENTIFIER") else { continue }
-                let sectionName = row.string("ZDISPLAYNAME") ?? ""
-                let members = membership.filter { $0.value == sectionIdentifier }.map { $0.key }
                 sections.append(
                     Section(
                         identifier: sectionIdentifier,
-                        name: sectionName,
-                        memberIdentifiers: members
+                        name: row.string("ZDISPLAYNAME") ?? ""
                     )
                 )
             }
+
+            let membership = membershipsResolved(
+                from: list.data("memberships"),
+                liveSectionIdentifiers: Set(sections.map(\.identifier))
+            )
 
             results.append(
                 ListSections(
@@ -454,8 +475,6 @@ final class RemindersDatabase {
                 continue
             }
 
-            let membership = memberships(from: row.data("memberships"))
-
             var sections: [Section] = []
             if sectionSupportsTemplates {
                 let sectionRows = try query(
@@ -473,13 +492,23 @@ final class RemindersDatabase {
                     sections.append(
                         Section(
                             identifier: sectionIdentifier,
-                            name: sectionRow.string("ZDISPLAYNAME") ?? "",
-                            memberIdentifiers: membership.filter { $0.value == sectionIdentifier }
-                                .map { $0.key }
+                            name: sectionRow.string("ZDISPLAYNAME") ?? ""
                         )
                     )
                 }
             }
+
+            // Same stale-membership hazard as lists — see `membershipsResolved`.
+            // Only resolve when the sections were actually enumerated; on an OS
+            // whose schema can't link sections to templates the set would be
+            // empty and would wrongly discard every membership.
+            let membership =
+                sectionSupportsTemplates
+                ? membershipsResolved(
+                    from: row.data("memberships"),
+                    liveSectionIdentifiers: Set(sections.map(\.identifier))
+                )
+                : memberships(from: row.data("memberships"))
 
             var items: [TemplateItem] = []
             if includeItems, hasSavedReminders {

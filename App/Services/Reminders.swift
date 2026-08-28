@@ -733,7 +733,9 @@ final class RemindersService: Service {
             description: """
                 List the sections (headings) within reminder lists, and which reminders \
                 belong to each. Sections are not exposed by EventKit, so this reads the \
-                local Reminders database and requires Full Disk Access.
+                local Reminders database and requires Full Disk Access. Counts are always \
+                totals: every section's "count" plus "unsectionedCount" equals the list's \
+                "totalCount", regardless of includeCompleted.
                 """,
             inputSchema: .object(
                 properties: [
@@ -747,8 +749,9 @@ final class RemindersService: Service {
                         default: true
                     ),
                     "includeCompleted": .boolean(
-                        description: "Include completed reminders",
-                        default: false
+                        description:
+                            "List completed reminders too. Counts always include them either way",
+                        default: true
                     ),
                 ],
                 additionalProperties: false
@@ -767,7 +770,7 @@ final class RemindersService: Service {
             var includeReminders = true
             if case .bool(let value) = arguments["includeReminders"] { includeReminders = value }
 
-            var includeCompleted = false
+            var includeCompleted = true
             if case .bool(let value) = arguments["includeCompleted"] { includeCompleted = value }
 
             let database = try RemindersDatabase.open()
@@ -779,24 +782,33 @@ final class RemindersService: Service {
             }
 
             return try listSections.map { list in
-                var remindersByIdentifier: [String: RemindersDatabase.ReminderRow] = [:]
-                var unsectionedCount = 0
-
-                // Reminders are always loaded so section counts stay accurate,
-                // even when the caller doesn't want them listed.
+                // Membership is walked reminder-first rather than section-first so
+                // that (a) every live reminder is accounted for exactly once —
+                // either under a section or in `unsectionedCount` — and (b) members
+                // come out in the list's stored order instead of the arbitrary
+                // order of a Dictionary's keys. Section-first also silently skipped
+                // membership entries left behind by deleted reminders.
                 let reminders = try database.reminders(inListWithIdentifier: list.listIdentifier)
-                for reminder in reminders where includeCompleted || !reminder.isCompleted {
-                    remindersByIdentifier[reminder.identifier] = reminder
-                    if list.sectionIdentifiersByReminder[reminder.identifier] == nil {
+
+                var membersBySection: [String: [RemindersDatabase.ReminderRow]] = [:]
+                var unsectionedCount = 0
+                for reminder in reminders {
+                    if let sectionIdentifier =
+                        list.sectionIdentifiersByReminder[reminder.identifier]
+                    {
+                        membersBySection[sectionIdentifier, default: []].append(reminder)
+                    } else {
                         unsectionedCount += 1
                     }
                 }
 
                 let sections: [Value] = list.sections.map { section in
-                    let members = section.memberIdentifiers.compactMap {
-                        remindersByIdentifier[$0]
-                    }
+                    let members = membersBySection[section.identifier] ?? []
 
+                    // Counts stay unfiltered so the totals always reconcile with
+                    // reminders_fetch; `includeCompleted` only decides what gets
+                    // listed. Filtering the counts made a list mid-way through
+                    // being checked off look like it had lost most of its items.
                     var object: [String: Value] = [
                         "name": .string(section.name),
                         "identifier": .string(section.identifier),
@@ -805,13 +817,14 @@ final class RemindersService: Service {
 
                     if includeReminders {
                         object["reminders"] = .array(
-                            members.map { reminder in
-                                .object([
-                                    "title": .string(reminder.title),
-                                    "identifier": .string(reminder.identifier),
-                                    "isCompleted": .bool(reminder.isCompleted),
-                                ])
-                            }
+                            members.filter { includeCompleted || !$0.isCompleted }
+                                .map { reminder in
+                                    .object([
+                                        "title": .string(reminder.title),
+                                        "identifier": .string(reminder.identifier),
+                                        "isCompleted": .bool(reminder.isCompleted),
+                                    ])
+                                }
                         )
                     }
 
@@ -823,6 +836,7 @@ final class RemindersService: Service {
                     "identifier": .string(list.listIdentifier),
                     "sections": .array(sections),
                     "unsectionedCount": .int(unsectionedCount),
+                    "totalCount": .int(reminders.count),
                 ])
             }
         }
@@ -908,24 +922,31 @@ final class RemindersService: Service {
                     return .object(itemObject)
                 }
 
+                // Item-first for the same reasons as reminders_sections above:
+                // every item lands in exactly one bucket, in stored order.
+                var itemsBySection: [String: [RemindersDatabase.TemplateItem]] = [:]
+                var unsectionedItems: [RemindersDatabase.TemplateItem] = []
+                for templateItem in template.items {
+                    if let sectionIdentifier =
+                        template.sectionIdentifiersByItem[templateItem.identifier]
+                    {
+                        itemsBySection[sectionIdentifier, default: []].append(templateItem)
+                    } else {
+                        unsectionedItems.append(templateItem)
+                    }
+                }
+
                 object["sections"] = .array(
                     template.sections.map { section in
                         .object([
                             "name": .string(section.name),
                             "identifier": .string(section.identifier),
-                            "items": .array(
-                                section.memberIdentifiers.compactMap { itemsByIdentifier[$0] }
-                                    .map(item)
-                            ),
+                            "items": .array((itemsBySection[section.identifier] ?? []).map(item)),
                         ])
                     }
                 )
 
-                object["unsectionedItems"] = .array(
-                    template.items
-                        .filter { template.sectionIdentifiersByItem[$0.identifier] == nil }
-                        .map(item)
-                )
+                object["unsectionedItems"] = .array(unsectionedItems.map(item))
 
                 return Value.object(object)
             }
