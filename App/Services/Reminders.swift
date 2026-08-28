@@ -26,6 +26,70 @@ private let reminderListColors: [String: NSColor] = [
     "gray": .systemGray,
 ]
 
+/// Appended to every tool that writes through Apple's private `ReminderKit`.
+private let privateAPIWarning = """
+    Sections and templates have no public Apple API, so this writes through an \
+    undocumented private framework. It could stop working, or behave unexpectedly, \
+    after a macOS update.
+    """
+
+/// Failures raised by the section and template tools.
+///
+/// These conform to `CustomStringConvertible` on purpose: the MCP layer renders
+/// thrown errors by interpolation, and a bare enum case name would tell the
+/// caller nothing about what went wrong or how to fix it.
+enum RemindersWriteError: LocalizedError, CustomStringConvertible {
+    case emptyValue(String)
+    case listNotFound(String, available: [String])
+    case ambiguousList(String, count: Int)
+    case listNotEditable(String)
+    case listAlreadyExists(String)
+    case sectionNotFound(section: String, list: String, available: [String])
+    case ambiguousSection(section: String, list: String, count: Int)
+    case sectionAlreadyExists(section: String, list: String)
+    case templateNotFound(String, available: [String])
+    case ambiguousTemplate(String, count: Int)
+    case templateAlreadyExists(String)
+
+    var description: String { errorDescription ?? "Reminders error" }
+
+    private static func list(_ names: [String]) -> String {
+        names.isEmpty ? "(none)" : names.map { "\"\($0)\"" }.joined(separator: ", ")
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .emptyValue(let field):
+            return "A non-empty \(field) is required"
+        case .listNotFound(let name, let available):
+            return
+                "No reminder list named \"\(name)\". Available lists: \(Self.list(available))"
+        case .ambiguousList(let name, let count):
+            return
+                "\"\(name)\" matches \(count) reminder lists. Rename one of them, or use the exact name, so there's only one match"
+        case .listNotEditable(let name):
+            return "The reminder list \"\(name)\" is read-only"
+        case .listAlreadyExists(let name):
+            return "A reminder list named \"\(name)\" already exists"
+        case .sectionNotFound(let section, let list, let available):
+            return
+                "No section named \"\(section)\" on \"\(list)\". Sections on that list: \(Self.list(available))"
+        case .ambiguousSection(let section, let list, let count):
+            return
+                "\"\(section)\" matches \(count) sections on \"\(list)\". Rename one of them so there's only one match"
+        case .sectionAlreadyExists(let section, let list):
+            return "\"\(list)\" already has a section named \"\(section)\""
+        case .templateNotFound(let name, let available):
+            return "No template named \"\(name)\". Available templates: \(Self.list(available))"
+        case .ambiguousTemplate(let name, let count):
+            return
+                "\"\(name)\" matches \(count) templates. Rename one of them so there's only one match"
+        case .templateAlreadyExists(let name):
+            return "A template named \"\(name)\" already exists"
+        }
+    }
+}
+
 final class RemindersService: Service {
     private let eventStore = EKEventStore()
 
@@ -39,6 +103,178 @@ final class RemindersService: Service {
 
     func activate() async throws {
         try await eventStore.requestFullAccessToReminders()
+    }
+
+    // MARK: - Strict target resolution
+    //
+    // Every write below turns a caller-supplied *name* into exactly one concrete
+    // identifier before anything is modified. Nothing here ever fuzzy-matches or
+    // picks a "best" candidate: zero matches and multiple matches are both hard
+    // errors, so a write can never land somewhere the caller didn't name.
+
+    private func requireAuthorization() throws {
+        guard EKEventStore.authorizationStatus(for: .reminder) == .fullAccess else {
+            log.error("Reminders access not authorized")
+            throw NSError(
+                domain: "RemindersError",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Reminders access not authorized"]
+            )
+        }
+    }
+
+    private static func requireName(_ arguments: [String: Value], _ key: String) throws -> String {
+        guard case .string(let value) = arguments[key] else {
+            throw RemindersWriteError.emptyValue(key)
+        }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw RemindersWriteError.emptyValue(key) }
+        return trimmed
+    }
+
+    /// The one reminder list with this exact name, or an error.
+    private func resolveList(named name: String) throws -> EKCalendar {
+        let lists = eventStore.calendars(for: .reminder)
+
+        // An exact match wins outright; only fall back to a case-insensitive
+        // match when nothing matched exactly.
+        var matches = lists.filter { $0.title == name }
+        if matches.isEmpty {
+            matches = lists.filter { $0.title.caseInsensitiveCompare(name) == .orderedSame }
+        }
+
+        guard let first = matches.first else {
+            throw RemindersWriteError.listNotFound(name, available: lists.map(\.title).sorted())
+        }
+        guard matches.count == 1 else {
+            throw RemindersWriteError.ambiguousList(name, count: matches.count)
+        }
+        guard first.allowsContentModifications else {
+            throw RemindersWriteError.listNotEditable(first.title)
+        }
+        return first
+    }
+
+    /// A section or template as the Reminders daemon reports it.
+    struct NamedObject {
+        let name: String
+        let identifier: String
+
+        init?(_ described: [String: String]) {
+            guard let name = described["name"], let identifier = described["identifier"] else {
+                return nil
+            }
+            self.name = name
+            self.identifier = identifier
+        }
+    }
+
+    /// Sections currently on a list, in display order. Empty if it has none.
+    ///
+    /// This goes through the Reminders daemon rather than the local database, so
+    /// writing to sections works with plain Reminders access — no Full Disk
+    /// Access, unlike the `reminders_sections` read tool.
+    private func sections(ofListWithIdentifier identifier: String) throws -> [NamedObject] {
+        try IMCPReminderKit.sections(inList: identifier).compactMap(NamedObject.init)
+    }
+
+    /// The one section with this exact name on the given list, or an error.
+    private func resolveSection(
+        named name: String,
+        on list: EKCalendar
+    ) throws -> NamedObject {
+        let all = try sections(ofListWithIdentifier: list.calendarIdentifier)
+
+        var matches = all.filter { $0.name == name }
+        if matches.isEmpty {
+            matches = all.filter { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+        }
+
+        guard let first = matches.first else {
+            throw RemindersWriteError.sectionNotFound(
+                section: name,
+                list: list.title,
+                available: all.map(\.name)
+            )
+        }
+        guard matches.count == 1 else {
+            throw RemindersWriteError.ambiguousSection(
+                section: name,
+                list: list.title,
+                count: matches.count
+            )
+        }
+        return first
+    }
+
+    /// Every saved template, by name and identifier.
+    private func templates() throws -> [NamedObject] {
+        try IMCPReminderKit.templates().compactMap(NamedObject.init)
+    }
+
+    /// The one template with this exact name, or an error.
+    private func resolveTemplate(named name: String) throws -> NamedObject {
+        let all = try templates()
+
+        var matches = all.filter { $0.name == name }
+        if matches.isEmpty {
+            matches = all.filter { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+        }
+
+        guard let first = matches.first else {
+            throw RemindersWriteError.templateNotFound(
+                name,
+                available: all.map(\.name).sorted()
+            )
+        }
+        guard matches.count == 1 else {
+            throw RemindersWriteError.ambiguousTemplate(name, count: matches.count)
+        }
+        return first
+    }
+
+    /// Files an already-saved reminder under one section of its list.
+    ///
+    /// EventKit and ReminderKit talk to the same daemon but not on the same
+    /// clock, so a reminder saved moments ago can briefly be invisible to
+    /// ReminderKit. Only that specific "not found" case is retried.
+    private static func assign(
+        reminder: EKReminder,
+        toSection section: NamedObject,
+        on list: EKCalendar
+    ) throws {
+        let notFound = 4  // IMCPReminderKitErrorNotFound
+        var lastError: Swift.Error?
+
+        for attempt in 0 ..< 4 {
+            if attempt > 0 { Thread.sleep(forTimeInterval: 0.2) }
+            do {
+                try IMCPReminderKit.assignReminder(
+                    identifier: reminder.calendarItemIdentifier,
+                    sectionIdentifier: section.identifier,
+                    listIdentifier: list.calendarIdentifier
+                )
+                return
+            } catch let error as NSError
+                where error.domain == "IMCPReminderKitError" && error.code == notFound
+            {
+                lastError = error
+            }
+        }
+
+        log.error(
+            "Could not file reminder into section: \(lastError?.localizedDescription ?? "unknown")"
+        )
+        throw lastError
+            ?? RemindersWriteError.sectionNotFound(
+                section: section.name,
+                list: list.title,
+                available: []
+            )
+    }
+
+    private func templateExists(named name: String) throws -> Bool {
+        try templates().contains { $0.name.caseInsensitiveCompare(name) == .orderedSame }
     }
 
     var tools: [Tool] {
@@ -216,7 +452,10 @@ final class RemindersService: Service {
 
         Tool(
             name: "reminders_create",
-            description: "Create a new reminder with specified properties",
+            description: """
+                Create a new reminder with specified properties, optionally placing it \
+                directly into one of the list's sections. \(privateAPIWarning)
+                """,
             inputSchema: .object(
                 properties: [
                     "title": .string(),
@@ -227,6 +466,14 @@ final class RemindersService: Service {
                     ),
                     "list": .string(
                         description: "Reminder list name (uses default if not specified)"
+                    ),
+                    "section": .string(
+                        description: """
+                            Name of an existing section (heading) on the list to file the \
+                            reminder under. The section must already exist — use \
+                            reminders_sections to see them and reminders_create_section to \
+                            add one. When given, the list name must match exactly one list.
+                            """
                     ),
                     "notes": .string(),
                     "priority": .string(
@@ -270,16 +517,36 @@ final class RemindersService: Service {
             }
             reminder.title = title
 
-            // Set calendar (list)
+            // A section can only be requested for a list we're certain about, so
+            // asking for one switches list lookup from "best effort" to strict.
+            var requestedSection: String? = nil
+            if case .string(let name) = arguments["section"],
+                !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                requestedSection = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
             var calendar = self.eventStore.defaultCalendarForNewReminders()
             if case .string(let listName) = arguments["list"] {
-                if let matchingCalendar = self.eventStore.calendars(for: .reminder)
+                if requestedSection != nil {
+                    calendar = try self.resolveList(named: listName)
+                } else if let matchingCalendar = self.eventStore.calendars(for: .reminder)
                     .first(where: { $0.title.lowercased() == listName.lowercased() })
                 {
                     calendar = matchingCalendar
                 }
             }
             reminder.calendar = calendar
+
+            // Resolve the section *before* creating anything, so a bad section
+            // name fails without leaving a stray reminder behind.
+            var section: NamedObject? = nil
+            if let requestedSection {
+                guard let calendar else {
+                    throw RemindersWriteError.emptyValue("list")
+                }
+                section = try self.resolveSection(named: requestedSection, on: calendar)
+            }
 
             // Set optional properties
             if case .string(let dueDateStr) = arguments["due"],
@@ -316,6 +583,14 @@ final class RemindersService: Service {
 
             // Save the reminder
             try self.eventStore.save(reminder, commit: true)
+
+            if let section, let calendar {
+                try Self.assign(
+                    reminder: reminder,
+                    toSection: section,
+                    on: calendar
+                )
+            }
 
             return PlanAction(reminder)
         }
@@ -557,9 +832,9 @@ final class RemindersService: Service {
             description: """
                 List saved Reminders templates, optionally with the items and sections \
                 a template contains. Templates are not exposed by EventKit, so this reads \
-                the local Reminders database and requires Full Disk Access. Reading is \
-                supported; creating a list from a template must still be done in the \
-                Reminders app.
+                the local Reminders database and requires Full Disk Access. Use \
+                reminders_save_as_template and reminders_apply_template to create \
+                templates and lists from them.
                 """,
             inputSchema: .object(
                 properties: [
@@ -654,6 +929,319 @@ final class RemindersService: Service {
 
                 return Value.object(object)
             }
+        }
+
+        Tool(
+            name: "reminders_create_section",
+            description: """
+                Add a section (heading) to an existing reminder list. \(privateAPIWarning)
+                """,
+            inputSchema: .object(
+                properties: [
+                    "list": .string(description: "Name of the list to add the section to"),
+                    "name": .string(description: "Name of the new section"),
+                ],
+                required: ["list", "name"],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Create Reminder Section",
+                destructiveHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            try await self.activate()
+            try self.requireAuthorization()
+
+            let listName = try Self.requireName(arguments, "list")
+            let sectionName = try Self.requireName(arguments, "name")
+
+            let list = try self.resolveList(named: listName)
+            let existing = try self.sections(ofListWithIdentifier: list.calendarIdentifier)
+
+            guard
+                !existing.contains(where: {
+                    $0.name.caseInsensitiveCompare(sectionName) == .orderedSame
+                })
+            else {
+                throw RemindersWriteError.sectionAlreadyExists(
+                    section: sectionName,
+                    list: list.title
+                )
+            }
+
+            let identifier = try IMCPReminderKit.createSection(
+                inList: list.calendarIdentifier,
+                existingSectionIdentifiers: existing.map(\.identifier),
+                displayName: sectionName
+            )
+
+            return Value.object([
+                "list": .string(list.title),
+                "name": .string(sectionName),
+                "identifier": .string(identifier),
+                "position": .int(existing.count + 1),
+            ])
+        }
+
+        Tool(
+            name: "reminders_rename_section",
+            description: """
+                Rename a section on a reminder list. The section is matched by its exact \
+                current name. \(privateAPIWarning)
+                """,
+            inputSchema: .object(
+                properties: [
+                    "list": .string(description: "Name of the list the section is on"),
+                    "section": .string(description: "Current name of the section"),
+                    "newName": .string(description: "New name for the section"),
+                ],
+                required: ["list", "section", "newName"],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Rename Reminder Section",
+                destructiveHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            try await self.activate()
+            try self.requireAuthorization()
+
+            let listName = try Self.requireName(arguments, "list")
+            let sectionName = try Self.requireName(arguments, "section")
+            let newName = try Self.requireName(arguments, "newName")
+
+            let list = try self.resolveList(named: listName)
+            let section = try self.resolveSection(named: sectionName, on: list)
+
+            if newName != section.name {
+                let existing = try self.sections(ofListWithIdentifier: list.calendarIdentifier)
+                guard
+                    !existing.contains(where: {
+                        $0.identifier != section.identifier
+                            && $0.name.caseInsensitiveCompare(newName) == .orderedSame
+                    })
+                else {
+                    throw RemindersWriteError.sectionAlreadyExists(
+                        section: newName,
+                        list: list.title
+                    )
+                }
+            }
+
+            try IMCPReminderKit.renameSection(identifier: section.identifier, name: newName)
+
+            return Value.object([
+                "list": .string(list.title),
+                "previousName": .string(section.name),
+                "name": .string(newName),
+                "identifier": .string(section.identifier),
+            ])
+        }
+
+        Tool(
+            name: "reminders_delete_section",
+            description: """
+                Delete a section from a reminder list, matched by its exact name. The \
+                section's reminders are kept — they stay on the list and become \
+                unsectioned. \(privateAPIWarning)
+                """,
+            inputSchema: .object(
+                properties: [
+                    "list": .string(description: "Name of the list the section is on"),
+                    "section": .string(description: "Name of the section to delete"),
+                ],
+                required: ["list", "section"],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Delete Reminder Section",
+                destructiveHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            try await self.activate()
+            try self.requireAuthorization()
+
+            let listName = try Self.requireName(arguments, "list")
+            let sectionName = try Self.requireName(arguments, "section")
+
+            let list = try self.resolveList(named: listName)
+            let section = try self.resolveSection(named: sectionName, on: list)
+
+            try IMCPReminderKit.deleteSection(identifier: section.identifier)
+
+            return Value.object([
+                "list": .string(list.title),
+                "deletedSection": .string(section.name),
+                "identifier": .string(section.identifier),
+                "note": .string(
+                    "Reminders that were in this section are still on the list; they are now "
+                        + "unsectioned."
+                ),
+            ])
+        }
+
+        Tool(
+            name: "reminders_save_as_template",
+            description: """
+                Save an existing reminder list as a new template, preserving its sections \
+                and items. \(privateAPIWarning)
+                """,
+            inputSchema: .object(
+                properties: [
+                    "list": .string(description: "Name of the list to save"),
+                    "templateName": .string(description: "Name for the new template"),
+                    "includeCompleted": .boolean(
+                        description: "Include completed reminders in the template",
+                        default: false
+                    ),
+                ],
+                required: ["list", "templateName"],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Save Reminder List as Template",
+                destructiveHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            try await self.activate()
+            try self.requireAuthorization()
+
+            let listName = try Self.requireName(arguments, "list")
+            let templateName = try Self.requireName(arguments, "templateName")
+
+            var includeCompleted = false
+            if case .bool(let value) = arguments["includeCompleted"] { includeCompleted = value }
+
+            let list = try self.resolveList(named: listName)
+
+            guard try !self.templateExists(named: templateName) else {
+                throw RemindersWriteError.templateAlreadyExists(templateName)
+            }
+
+            let identifier = try IMCPReminderKit.createTemplate(
+                named: templateName,
+                fromList: list.calendarIdentifier,
+                includeCompleted: includeCompleted
+            )
+
+            return Value.object([
+                "name": .string(templateName),
+                "identifier": .string(identifier),
+                "sourceList": .string(list.title),
+                "includeCompleted": .bool(includeCompleted),
+            ])
+        }
+
+        Tool(
+            name: "reminders_apply_template",
+            description: """
+                Create a new reminder list from a saved template, matched by its exact \
+                name, then rename the result. The list arrives with the template's \
+                sections and items. \(privateAPIWarning)
+                """,
+            inputSchema: .object(
+                properties: [
+                    "templateName": .string(description: "Name of the template to apply"),
+                    "newListName": .string(description: "Name for the list to create"),
+                ],
+                required: ["templateName", "newListName"],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Create Reminder List from Template",
+                destructiveHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            try await self.activate()
+            try self.requireAuthorization()
+
+            let templateName = try Self.requireName(arguments, "templateName")
+            let newListName = try Self.requireName(arguments, "newListName")
+
+            let template = try self.resolveTemplate(named: templateName)
+
+            guard
+                !self.eventStore.calendars(for: .reminder)
+                    .contains(where: { $0.title.caseInsensitiveCompare(newListName) == .orderedSame
+                    })
+            else {
+                throw RemindersWriteError.listAlreadyExists(newListName)
+            }
+
+            // ReminderKit gives the new list the *template's* name and offers no
+            // way to override it, so renaming is a second, separate step.
+            let identifier = try IMCPReminderKit.createList(fromTemplate: template.identifier)
+
+            var renamed = true
+            do {
+                try IMCPReminderKit.renameList(identifier: identifier, name: newListName)
+            } catch {
+                renamed = false
+                log.error(
+                    "Created list from template but could not rename it: \(error.localizedDescription)"
+                )
+            }
+
+            // Reminders fills the new list in asynchronously, so its sections can
+            // take a moment to appear. Give them a brief chance before reporting.
+            var sectionCount = 0
+            for attempt in 0 ..< 10 {
+                if attempt > 0 { try? await Task.sleep(nanoseconds: 300_000_000) }
+                sectionCount = (try? self.sections(ofListWithIdentifier: identifier).count) ?? 0
+                if sectionCount > 0 { break }
+            }
+
+            var result: [String: Value] = [
+                "list": .string(renamed ? newListName : template.name),
+                "identifier": .string(identifier),
+                "template": .string(template.name),
+                "sectionCount": .int(sectionCount),
+            ]
+            if !renamed {
+                result["warning"] = .string(
+                    "The list was created but could not be renamed, so it still has the "
+                        + "template's name \"\(template.name)\"."
+                )
+            }
+            return Value.object(result)
+        }
+
+        Tool(
+            name: "reminders_delete_template",
+            description: """
+                Delete a saved Reminders template, matched by its exact name. Lists that \
+                were already created from it are not affected. \(privateAPIWarning)
+                """,
+            inputSchema: .object(
+                properties: [
+                    "templateName": .string(description: "Name of the template to delete")
+                ],
+                required: ["templateName"],
+                additionalProperties: false
+            ),
+            annotations: .init(
+                title: "Delete Reminder Template",
+                destructiveHint: true,
+                openWorldHint: false
+            )
+        ) { arguments in
+            try await self.activate()
+            try self.requireAuthorization()
+
+            let templateName = try Self.requireName(arguments, "templateName")
+            let template = try self.resolveTemplate(named: templateName)
+
+            try IMCPReminderKit.deleteTemplate(identifier: template.identifier)
+
+            return Value.object([
+                "deletedTemplate": .string(template.name),
+                "identifier": .string(template.identifier),
+            ])
         }
     }
 }
