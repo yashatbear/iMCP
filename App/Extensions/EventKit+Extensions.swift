@@ -38,7 +38,10 @@ extension EKAlarm {
         switch type {
         case "relative":
             if let minutes = config["minutes"]?.numericValue {
+                // Positive `minutes` fires before the due date, so negate for `relativeOffset`.
                 alarm = EKAlarm(relativeOffset: TimeInterval(-minutes * 60))
+            } else {
+                log.error("Relative alarm requires a numeric `minutes`")
             }
 
         case "absolute":
@@ -51,7 +54,13 @@ extension EKAlarm {
                     fromISO8601String: datetimeStr
                 ) {
                     alarm = EKAlarm(absoluteDate: absoluteDate)
+                } else {
+                    log.error(
+                        "Absolute alarm datetime is not a valid ISO 8601 string: \(datetimeStr, privacy: .public)"
+                    )
                 }
+            } else {
+                log.error("Absolute alarm requires a `datetime` string")
             }
 
         case "proximity":
@@ -64,15 +73,15 @@ extension EKAlarm {
                     latitude: latitude,
                     longitude: longitude
                 )
-                if let radius = config["radius"]?.numericValue {
-                    structuredLocation.radius = radius
-                }
+                // Match the schema's documented default when `radius` is omitted;
+                // an unset radius leaves the geofence at 0 m, which never fires.
+                structuredLocation.radius = config["radius"]?.numericValue ?? 200
 
-                let a = EKAlarm()
-                a.structuredLocation = structuredLocation
-                a.proximity =
+                let proximityAlarm = EKAlarm()
+                proximityAlarm.structuredLocation = structuredLocation
+                proximityAlarm.proximity =
                     (config["proximity"]?.stringValue ?? "enter") == "leave" ? .leave : .enter
-                alarm = a
+                alarm = proximityAlarm
             } else {
                 log.error("Proximity alarm requires locationTitle, latitude, and longitude")
             }

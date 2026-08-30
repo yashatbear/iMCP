@@ -499,7 +499,7 @@ final class RemindersService: Service {
                                         "type": .string(const: "relative"),
                                         "minutes": .integer(
                                             description:
-                                                "Minutes offset from the due date (negative for before, positive for after)"
+                                                "Minutes offset from the due date (positive fires before the due date, negative after)"
                                         ),
                                         "sound": .string(
                                             description: "Sound name to play when the alarm triggers",
@@ -545,8 +545,12 @@ final class RemindersService: Service {
                                         "locationTitle": .string(
                                             description: "Human-readable name for the location"
                                         ),
-                                        "latitude": .number(),
-                                        "longitude": .number(),
+                                        "latitude": .number(
+                                            description: "Latitude in decimal degrees"
+                                        ),
+                                        "longitude": .number(
+                                            description: "Longitude in decimal degrees"
+                                        ),
                                         "radius": .number(
                                             description: "Trigger radius in meters",
                                             default: .int(200)
