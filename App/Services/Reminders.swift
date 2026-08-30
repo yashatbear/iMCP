@@ -454,7 +454,9 @@ final class RemindersService: Service {
             name: "reminders_create",
             description: """
                 Create a new reminder with specified properties, optionally placing it \
-                directly into one of the list's sections. \(privateAPIWarning)
+                directly into one of the list's sections. Supports time-based alarms and \
+                location-based ("remind me when I arrive at / leave") reminders via the \
+                `alarms` property. \(privateAPIWarning)
                 """,
             inputSchema: .object(
                 properties: [
@@ -481,8 +483,91 @@ final class RemindersService: Service {
                         enum: EKReminderPriority.allCases.map { .string($0.stringValue) }
                     ),
                     "alarms": .array(
-                        description: "Minutes before due date to set alarms",
-                        items: .integer()
+                        description: """
+                            Alarms for the reminder. Each item is either an integer \
+                            (minutes before the due date) or an alarm object.
+                            """,
+                        items: .anyOf(
+                            [
+                                // Shorthand: minutes before the due date
+                                .integer(
+                                    description: "Minutes before the due date to fire an alarm"
+                                ),
+                                // Relative alarm (minutes before/after the due date)
+                                .object(
+                                    properties: [
+                                        "type": .string(const: "relative"),
+                                        "minutes": .integer(
+                                            description:
+                                                "Minutes offset from the due date (positive fires before the due date, negative after)"
+                                        ),
+                                        "sound": .string(
+                                            description: "Sound name to play when the alarm triggers",
+                                            enum: Sound.allCases.map { .string($0.rawValue) }
+                                        ),
+                                        "emailAddress": .string(
+                                            description: "Email address to send a notification to"
+                                        ),
+                                    ],
+                                    required: ["minutes"],
+                                    additionalProperties: false
+                                ),
+                                // Absolute alarm (specific date/time)
+                                .object(
+                                    properties: [
+                                        "type": .string(const: "absolute"),
+                                        "datetime": .string(
+                                            description:
+                                                "Alarm date/time. If timezone is omitted, local time is assumed. Must include a time component.",
+                                            format: .dateTime
+                                        ),
+                                        "sound": .string(
+                                            description: "Sound name to play when the alarm triggers",
+                                            enum: Sound.allCases.map { .string($0.rawValue) }
+                                        ),
+                                        "emailAddress": .string(
+                                            description: "Email address to send a notification to"
+                                        ),
+                                    ],
+                                    required: ["datetime"],
+                                    additionalProperties: false
+                                ),
+                                // Proximity alarm (location-based: fire on arriving/leaving)
+                                .object(
+                                    properties: [
+                                        "type": .string(const: "proximity"),
+                                        "proximity": .string(
+                                            description:
+                                                "Fire when arriving at ('enter') or leaving ('leave') the location",
+                                            default: "enter",
+                                            enum: ["enter", "leave"]
+                                        ),
+                                        "locationTitle": .string(
+                                            description: "Human-readable name for the location"
+                                        ),
+                                        "latitude": .number(
+                                            description: "Latitude in decimal degrees"
+                                        ),
+                                        "longitude": .number(
+                                            description: "Longitude in decimal degrees"
+                                        ),
+                                        "radius": .number(
+                                            description: "Trigger radius in meters",
+                                            default: .int(200)
+                                        ),
+                                        "sound": .string(
+                                            description: "Sound name to play when the alarm triggers",
+                                            enum: Sound.allCases.map { .string($0.rawValue) }
+                                        ),
+                                        "emailAddress": .string(
+                                            description: "Email address to send a notification to"
+                                        ),
+                                    ],
+                                    required: ["locationTitle", "latitude", "longitude"],
+                                    additionalProperties: false
+                                ),
+                            ]
+                        )
                     ),
                 ],
                 required: ["title"],
@@ -573,12 +658,11 @@ final class RemindersService: Service {
                 reminder.priority = Int(EKReminderPriority.from(string: priorityStr).rawValue)
             }
 
-            // Set alarms
-            if case .array(let alarmMinutes) = arguments["alarms"] {
-                reminder.alarms = alarmMinutes.compactMap {
-                    guard case .int(let minutes) = $0 else { return nil }
-                    return EKAlarm(relativeOffset: TimeInterval(-minutes * 60))
-                }
+            // Set alarms — time-based (integer minutes, or relative/absolute objects)
+            // and location-based (proximity objects). See EKAlarm.alarms(from:),
+            // shared with calendar_events_create.
+            if case .array = arguments["alarms"] {
+                reminder.alarms = EKAlarm.alarms(from: arguments["alarms"])
             }
 
             // Save the reminder

@@ -1,5 +1,4 @@
 import AppKit
-import CoreLocation
 import EventKit
 import Foundation
 import OSLog
@@ -262,7 +261,7 @@ final class CalendarService: Service {
                                         ),
                                         "minutes": .integer(
                                             description:
-                                                "Minutes offset from event start (negative for before, positive for after)"
+                                                "Minutes offset from event start (positive fires before the event, negative after)"
                                         ),
                                         "sound": .string(
                                             description: "Sound name to play when alarm triggers",
@@ -448,86 +447,9 @@ final class CalendarService: Service {
                 event.availability = EKEventAvailability(availability)
             }
 
-            // Set alarms
-            if case .array(let alarmConfigs) = arguments["alarms"] {
-                var alarms: [EKAlarm] = []
-
-                for alarmConfig in alarmConfigs {
-                    guard case .object(let config) = alarmConfig else { continue }
-
-                    var alarm: EKAlarm?
-
-                    let alarmType = config["type"]?.stringValue ?? "relative"
-                    switch alarmType {
-                    case "relative":
-                        if case .int(let minutes) = config["minutes"] {
-                            alarm = EKAlarm(relativeOffset: TimeInterval(-minutes * 60))
-                        }
-
-                    case "absolute":
-                        if case .string(let datetimeStr) = config["datetime"] {
-                            if ISO8601DateFormatter.isDateOnlyISO8601String(datetimeStr) {
-                                log.error(
-                                    "Absolute alarm datetime must include time component: \(datetimeStr, privacy: .public)"
-                                )
-                            } else if let absoluteDate = ISO8601DateFormatter.lenientDate(
-                                fromISO8601String: datetimeStr
-                            ) {
-                                alarm = EKAlarm(absoluteDate: absoluteDate)
-                            }
-                        }
-
-                    case "proximity":
-                        if case .string(let locationTitle) = config["locationTitle"],
-                            case .double(let latitude) = config["latitude"],
-                            case .double(let longitude) = config["longitude"]
-                        {
-                            alarm = EKAlarm()
-
-                            // Create structured location
-                            let structuredLocation = EKStructuredLocation(title: locationTitle)
-                            structuredLocation.geoLocation = CLLocation(
-                                latitude: latitude,
-                                longitude: longitude
-                            )
-
-                            if case .double(let radius) = config["radius"] {
-                                structuredLocation.radius = radius
-                            } else if case .int(let radiusInt) = config["radius"] {
-                                structuredLocation.radius = Double(radiusInt)
-                            }
-
-                            // Set proximity type
-                            let proximityType = config["proximity"]?.stringValue ?? "enter"
-                            let proximity: EKAlarmProximity =
-                                proximityType == "enter" ? .enter : .leave
-                            alarm?.proximity = proximity
-                            alarm?.structuredLocation = structuredLocation
-                        }
-
-                    default:
-                        log.error(
-                            "Unexpected alarm type encountered: \(alarmType, privacy: .public)"
-                        )
-                        continue
-                    }
-
-                    guard let alarm = alarm else { continue }
-
-                    if case .string(let soundName) = config["sound"],
-                        Sound(rawValue: soundName) != nil
-                    {
-                        alarm.soundName = soundName
-                    }
-
-                    if case .string(let email) = config["emailAddress"], !email.isEmpty {
-                        alarm.emailAddress = email
-                    }
-
-                    alarms.append(alarm)
-                }
-
-                event.alarms = alarms
+            // Set alarms (relative / absolute / proximity — see EKAlarm.alarms(from:))
+            if case .array = arguments["alarms"] {
+                event.alarms = EKAlarm.alarms(from: arguments["alarms"])
             }
 
             // Save the event
