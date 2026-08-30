@@ -14,10 +14,10 @@ struct ContentView: View {
         serverController.computedServiceConfigs
     }
 
-    private var serviceBindings: [String: Binding<Bool>] {
+    private var serviceEnabledMap: [String: Bool] {
         Dictionary(
             uniqueKeysWithValues: serviceConfigs.map {
-                ($0.id, $0.binding)
+                ($0.id, $0.binding.wrappedValue)
             }
         )
     }
@@ -69,7 +69,7 @@ struct ContentView: View {
                 .padding(.horizontal, 2)
                 .onChange(of: serviceConfigs.map { $0.binding.wrappedValue }, initial: true) {
                     Task {
-                        await serverController.updateServiceBindings(serviceBindings)
+                        await serverController.updateServiceBindings(serviceEnabledMap)
                     }
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
