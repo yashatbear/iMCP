@@ -6,6 +6,7 @@ import SystemPackage
 
 import struct Foundation.Data
 import class Foundation.RunLoop
+import func Foundation.NSUserName
 
 var log = Logger(label: "me.mattt.iMCP.server") { StreamLogHandler.standardError(label: $0) }
 #if DEBUG
@@ -16,6 +17,11 @@ var log = Logger(label: "me.mattt.iMCP.server") { StreamLogHandler.standardError
 
 // Network setup
 let serviceType = "_mcp._tcp"
+
+/// Only ever connect to the iMCP app owned by the current macOS user. With
+/// several users logged in (fast user switching), each runs its own iMCP and
+/// connecting to another user's instance would expose their data.
+let expectedServiceName = "iMCP-\(NSUserName())"
 let parameters = NWParameters.tcp
 parameters.acceptLocalOnly = true
 parameters.includePeerToPeer = false
@@ -536,26 +542,20 @@ actor MCPService: Service {
 
                             // If we have results, select the most appropriate one
                             if !results.isEmpty {
-                                // First, try to find a service with "iMCP" in the endpoint description
-                                let imcpServices = results.filter {
-                                    String(describing: $0.endpoint).contains("iMCP")
+                                // Only accept this user's own iMCP instance.
+                                let ownServices = results.filter {
+                                    if case let .service(name, _, _, _) = $0.endpoint {
+                                        return name == expectedServiceName
+                                    }
+                                    return false
                                 }
-
-                                let selectedService: NWBrowser.Result
-
-                                if !imcpServices.isEmpty {
-                                    // Prefer services with iMCP in the description
-                                    selectedService = imcpServices.first!
+                                guard let selectedService = ownServices.first else {
                                     await log.info(
-                                        "Selected iMCP service: \(selectedService.endpoint)"
+                                        "No \(expectedServiceName) service yet; ignoring \(results.count) other(s)"
                                     )
-                                } else {
-                                    // Fall back to the first available service
-                                    selectedService = results.first!
-                                    await log.info(
-                                        "No specific iMCP service found, using: \(selectedService.endpoint)"
-                                    )
+                                    return
                                 }
+                                await log.info("Selected iMCP service: \(selectedService.endpoint)")
 
                                 if await connectionState.checkAndSetResumed() {
                                     timeoutTask.cancel()

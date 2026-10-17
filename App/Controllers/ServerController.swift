@@ -13,6 +13,10 @@ import class Foundation.JSONDecoder
 import class Foundation.JSONEncoder
 
 private let serviceType = "_mcp._tcp"
+
+/// Per-macOS-user Bonjour instance name, so several logged-in users can each
+/// run their own iMCP and each user's imcp-server finds only its own app.
+let perUserServiceName = "iMCP-\(NSUserName())"
 private let serviceDomain = "local."
 
 private let log = Logger.server
@@ -571,7 +575,7 @@ actor NetworkDiscoveryManager {
 
         // Listen and advertise via Bonjour.
         self.listener = try NWListener(using: parameters)
-        self.listener.service = NWListener.Service(type: serviceType, domain: serviceDomain)
+        self.listener.service = NWListener.Service(name: perUserServiceName, type: serviceType, domain: serviceDomain)
 
         // Browser is used for monitoring and diagnostics.
         self.browser = NWBrowser(
@@ -617,7 +621,7 @@ actor NetworkDiscoveryManager {
         }
 
         let newListener: NWListener = try NWListener(using: parameters)
-        let service = NWListener.Service(type: self.serviceType, domain: self.serviceDomain)
+        let service = NWListener.Service(name: perUserServiceName, type: self.serviceType, domain: self.serviceDomain)
         newListener.service = service
 
         if let currentStateHandler = listener.stateUpdateHandler {
